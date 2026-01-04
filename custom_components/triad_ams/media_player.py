@@ -317,6 +317,7 @@ class TriadAmsMediaPlayer(MediaPlayerEntity):
         | MediaPlayerEntityFeature.VOLUME_MUTE
         | MediaPlayerEntityFeature.VOLUME_STEP
         | MediaPlayerEntityFeature.SELECT_SOURCE
+        | MediaPlayerEntityFeature.GROUPING
     )
     _attr_should_poll = False
     _attr_has_entity_name = True
@@ -525,8 +526,10 @@ class TriadAmsMediaPlayer(MediaPlayerEntity):
     async def async_added_to_hass(self) -> None:
         """Entity added to Home Assistant: seed and write initial state."""
         self._update_link_subscription()
-        # Subscribe to coordinator availability changes (Silver requirement)
         coordinator = self.output.coordinator
+        if hasattr(coordinator, "register_entity"):
+            coordinator.register_entity(self)
+        # Subscribe to coordinator availability changes (Silver requirement)
         if hasattr(coordinator, "add_availability_listener"):
             self._availability_unsub = coordinator.add_availability_listener(
                 self._update_availability
@@ -549,6 +552,33 @@ class TriadAmsMediaPlayer(MediaPlayerEntity):
         if self._availability_unsub is not None:
             self._availability_unsub()
             self._availability_unsub = None
+        coordinator = self.output.coordinator
+        if hasattr(coordinator, "unregister_entity"):
+            coordinator.unregister_entity(self.entity_id)
+
+    @property
+    def group_members(self) -> list[str] | None:
+        """Return grouped members if this entity is the leader."""
+        coordinator = self.output.coordinator
+        if self.entity_id and hasattr(coordinator, "group_members_for"):
+            return coordinator.group_members_for(self.entity_id)
+        return None
+
+    @property
+    def group_leader(self) -> str | None:
+        """Return the leader entity_id if this entity is grouped."""
+        coordinator = self.output.coordinator
+        if self.entity_id and hasattr(coordinator, "group_leader_for"):
+            return coordinator.group_leader_for(self.entity_id)
+        return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Expose group leader in state attributes for UI consumers."""
+        leader = self.group_leader
+        if leader is None:
+            return None
+        return {"group_leader": leader}
 
     async def async_set_volume_level(self, volume: float) -> None:
         """Set the volume level of the output (0..1)."""
@@ -623,3 +653,111 @@ class TriadAmsMediaPlayer(MediaPlayerEntity):
         await self.output.turn_on()
         self._update_link_subscription()
         self.async_write_ha_state()
+
+    async def async_join_players(self, group_members: list[str]) -> None:
+        """Join this output with other Triad outputs by routing to the same input."""
+        if not self.entity_id:
+            return
+        _LOGGER.debug(
+            "async_join_players: caller=%s group_members=%s",
+            self.entity_id,
+            group_members,
+        )
+        coordinator = self.output.coordinator
+        if not hasattr(coordinator, "get_entity") or not hasattr(coordinator, "set_group"):
+            raise HomeAssistantError("Grouping is not available")
+
+        leader_entity_id = self.entity_id
+        # Preserve an existing group leader if this entity is already a member.
+        if hasattr(coordinator, "group_leader_for"):
+            existing_leader = coordinator.group_leader_for(self.entity_id)
+            if existing_leader:
+                leader_entity_id = existing_leader
+        _LOGGER.debug(
+            "async_join_players: resolved leader=%s (caller=%s)",
+            leader_entity_id,
+            self.entity_id,
+        )
+
+        members: set[str] = {self.entity_id, leader_entity_id}
+        # Merge existing leader group to make join additive.
+        if hasattr(coordinator, "group_members_for"):
+            existing = coordinator.group_members_for(leader_entity_id)
+            if existing:
+                members.update(existing)
+        for member_id in group_members:
+            if member_id == self.entity_id:
+                continue
+            member = coordinator.get_entity(member_id)
+            if not isinstance(member, TriadAmsMediaPlayer):
+                raise HomeAssistantError(f"Unsupported group member: {member_id}")
+            members.add(member_id)
+
+        leader_entity = coordinator.get_entity(leader_entity_id)
+        if not isinstance(leader_entity, TriadAmsMediaPlayer):
+            raise HomeAssistantError("Group leader not available")
+        leader_input = leader_entity.output.source
+        if leader_input is None:
+            raise HomeAssistantError("Cannot join without a selected source")
+        _LOGGER.debug(
+            "async_join_players: leader_input=%s leader_entity=%s",
+            leader_input,
+            leader_entity_id,
+        )
+
+        for member_id in members:
+            if member_id == leader_entity_id:
+                continue
+            member = coordinator.get_entity(member_id)
+            if isinstance(member, TriadAmsMediaPlayer):
+                await member.output.set_source(leader_input)
+                member._update_link_subscription()
+                member.async_write_ha_state()
+
+        coordinator.set_group(leader_entity_id, members)
+        # Refresh HA state after group membership is updated so group_leader
+        # and group_members are accurate for all members.
+        for member_id in members:
+            member = coordinator.get_entity(member_id)
+            if isinstance(member, TriadAmsMediaPlayer):
+                member.async_write_ha_state()
+        self.async_write_ha_state()
+
+    async def async_unjoin_player(self) -> None:
+        """Unjoin this output from the group without turning it off."""
+        _LOGGER.debug("async_unjoin_player: caller=%s", self.entity_id)
+        coordinator = self.output.coordinator
+        impacted: set[str] = set()
+        if not self.entity_id:
+            return
+
+        leader_id: str | None = None
+        if hasattr(coordinator, "group_leader_for"):
+            leader_id = coordinator.group_leader_for(self.entity_id)
+
+        if leader_id:
+            impacted.add(leader_id)
+            if hasattr(coordinator, "group_members_for"):
+                members = coordinator.group_members_for(leader_id) or []
+                impacted.update(members)
+            if hasattr(coordinator, "remove_from_group"):
+                coordinator.remove_from_group(self.entity_id)
+        else:
+            if hasattr(coordinator, "group_members_for"):
+                members = coordinator.group_members_for(self.entity_id) or []
+                impacted.update(members)
+            impacted.add(self.entity_id)
+            # If the leader is leaving, promote the first remaining member.
+            if members and len(members) > 1:
+                remaining = [m for m in members if m != self.entity_id]
+                new_leader = remaining[0]
+                coordinator.set_group(new_leader, set(remaining))
+            elif hasattr(coordinator, "remove_from_group"):
+                coordinator.remove_from_group(self.entity_id)
+
+        self._update_link_subscription()
+        self.async_write_ha_state()
+        for member_id in impacted:
+            member = coordinator.get_entity(member_id)
+            if isinstance(member, TriadAmsMediaPlayer):
+                member.async_write_ha_state()

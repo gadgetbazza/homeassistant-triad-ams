@@ -23,10 +23,18 @@ if TYPE_CHECKING:
 
     from .models import TriadAmsOutput
 
+from . import const
 from .connection import TriadConnection
-from .const import CONNECTION_TIMEOUT, NETWORK_EXCEPTIONS, SHUTDOWN_TIMEOUT
 
 _LOGGER = logging.getLogger(__name__)
+
+CONNECTION_TIMEOUT = getattr(const, "CONNECTION_TIMEOUT", 5.0)
+SHUTDOWN_TIMEOUT = getattr(const, "SHUTDOWN_TIMEOUT", 1.0)
+NETWORK_EXCEPTIONS = getattr(
+    const,
+    "NETWORK_EXCEPTIONS",
+    (OSError, TimeoutError, asyncio.IncompleteReadError, asyncio.CancelledError),
+)
 
 
 @dataclass
@@ -80,6 +88,10 @@ class TriadCoordinator:
         self._poll_interval = max(1.0, poll_interval)
         # Weak set of outputs to poll; avoids retaining entities
         self._outputs: weakref.WeakSet[TriadAmsOutput] = weakref.WeakSet()
+        # Weak mapping of entity_id -> entity for group operations
+        self._entities: weakref.WeakValueDictionary[str, Any] = (
+            weakref.WeakValueDictionary()
+        )
         self._poll_index: int = 0
         # Track active outputs per zone (zone -> set of output numbers)
         # Zones are 1-based and mapped in groups of 8 outputs (clamped 1..3).
@@ -91,6 +103,8 @@ class TriadCoordinator:
         )
         # Track input link unsubscribe functions for cleanup
         self._input_link_unsubs: list[Callable[[], None]] = []
+        # Track HA group membership (leader entity_id -> member entity_ids)
+        self._groups: dict[str, set[str]] = {}
 
     @property
     def input_link_unsubs(self) -> list[Callable[[], None]]:
@@ -193,6 +207,65 @@ class TriadCoordinator:
     def register_output(self, output: TriadAmsOutput) -> None:
         """Register an output for lightweight rolling polling."""
         self._outputs.add(output)
+
+    def register_entity(self, entity: Any) -> None:
+        """Register a media player entity for group operations."""
+        entity_id = getattr(entity, "entity_id", None)
+        if entity_id:
+            self._entities[entity_id] = entity
+
+    def unregister_entity(self, entity_id: str | None) -> None:
+        """Unregister a media player entity from group operations."""
+        if not entity_id:
+            return
+        with contextlib.suppress(KeyError):
+            del self._entities[entity_id]
+        self.remove_from_group(entity_id)
+
+    def get_entity(self, entity_id: str) -> Any | None:
+        """Return the registered entity for the given entity_id, if any."""
+        return self._entities.get(entity_id)
+
+    def set_group(self, leader_id: str, members: set[str]) -> None:
+        """Set group membership for a leader, clearing previous groups."""
+        normalized = set(members)
+        normalized.add(leader_id)
+        for entity_id in list(normalized):
+            self.remove_from_group(entity_id)
+        if len(normalized) <= 1:
+            self._groups.pop(leader_id, None)
+            return
+        self._groups[leader_id] = normalized
+
+    def remove_from_group(self, entity_id: str) -> None:
+        """Remove an entity from any group; dissolve if leader or last member."""
+        to_remove: list[str] = []
+        for leader_id, members in self._groups.items():
+            if leader_id == entity_id:
+                to_remove.append(leader_id)
+                continue
+            if entity_id in members:
+                members.discard(entity_id)
+                if len(members) <= 1:
+                    to_remove.append(leader_id)
+        for leader_id in to_remove:
+            self._groups.pop(leader_id, None)
+
+    def group_leader_for(self, entity_id: str) -> str | None:
+        """Return the leader entity_id if this entity is grouped as a member."""
+        for leader_id, members in self._groups.items():
+            if entity_id in members and leader_id != entity_id:
+                return leader_id
+        return None
+
+    def group_members_for(self, entity_id: str) -> list[str] | None:
+        """Return group members if this entity is the leader."""
+        members = self._groups.get(entity_id)
+        if members and len(members) > 1:
+            # Return all members with the leader first for UI compatibility.
+            others = sorted(members - {entity_id})
+            return [entity_id, *others]
+        return None
 
     async def _ensure_connection(self) -> None:
         """Ensure connection is established and update availability state."""

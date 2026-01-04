@@ -14,15 +14,15 @@ from typing import TYPE_CHECKING, cast
 if TYPE_CHECKING:
     from asyncio import StreamReader, StreamWriter
 
-from .const import (
-    CONNECTION_TIMEOUT,
-    DEVICE_COMMAND_DELAY,
-    POST_CONNECT_DELAY,
-    VOLUME_STEPS,
-)
+from . import const
 from .volume_lut import step_for_db
 
 _LOGGER = logging.getLogger(__name__)
+
+CONNECTION_TIMEOUT = getattr(const, "CONNECTION_TIMEOUT", 5.0)
+DEVICE_COMMAND_DELAY = getattr(const, "DEVICE_COMMAND_DELAY", 0.1)
+POST_CONNECT_DELAY = getattr(const, "POST_CONNECT_DELAY", 0.2)
+VOLUME_STEPS = getattr(const, "VOLUME_STEPS", 0x64)
 
 
 class TriadConnection:
