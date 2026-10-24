@@ -18,7 +18,6 @@ from .const import (
     BUFFER_DRAIN_TIMEOUT,
     CLEAN_EXCHANGES_TO_SKIP_DRAIN,
     CONNECTION_TIMEOUT,
-    DEVICE_COMMAND_DELAY,
     POST_CONNECT_DELAY,
     VOLUME_STEPS,
 )
@@ -149,8 +148,9 @@ class TriadConnection:
         self._log_protocol("TX %s", self._summarize_bytes(command))
         writer.write(command)
         await writer.drain()
-        # Add a very small delay for device tolerance
-        await asyncio.sleep(DEVICE_COMMAND_DELAY)
+        # No fixed delay before the read: readuntil() waits for the reply's NUL
+        # terminator, and the coordinator already spaces commands by
+        # min_send_interval.
 
     async def _read_response_bytes(self, reader: "StreamReader") -> bytes:
         """Read response bytes from the connection."""
